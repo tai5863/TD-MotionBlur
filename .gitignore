@@ -2,3 +2,6 @@ Backup/
 
 .DS_Store
 Thumbs.db
+
+# Numbered TouchDesigner backups
+main.[0-9]*.toe
