@@ -1,110 +1,153 @@
 uniform float sampleCount;
-uniform float exposureTime;
-float cameraFar;
-
+uniform float exposure;
+uniform bool useVmax;
 const float SOFT_Z_EXTENT = 0.01;
+const vec2 ENCODED_ZERO_VELOCITY = vec2(0.5);
+const float ENCODE_SCALE = 2.0;
+const float MAX_BLUR_PIXELS = 32.0;
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-// 8bit → -1..1 velocity decoding
 vec2 decodeVelocity(const in vec2 e) {
-    vec2 t = (e - vec2(127.0 / 255.0)) * (255.0 / 127.0); // ≒ -1..1
-
+    vec2 t = (e - ENCODED_ZERO_VELOCITY) * ENCODE_SCALE;
     vec2 v = t * abs(t);
     v.y = -v.y;
     return v;
 }
 
-float readDepth(sampler2D depthMap, vec2 uv) {
-    return texture(depthMap, uv).r;
+ivec2 uvToTexel(vec2 uv, ivec2 size) {
+    return clamp(ivec2(uv * vec2(size)), ivec2(0), size - ivec2(1));
+}
+
+vec2 readVelocityPoint(sampler2D velocityMap, vec2 uv) {
+    ivec2 size = textureSize(velocityMap, 0);
+    return texelFetch(velocityMap, uvToTexel(uv, size), 0).xy;
+}
+
+float readDepthPoint(sampler2D depthMap, vec2 uv) {
+    ivec2 size = textureSize(depthMap, 0);
+    return texelFetch(depthMap, uvToTexel(uv, size), 0).r;
 }
 
 float rand(vec2 uv) {
     return fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
-float softDepthCompare(float currentDepth, float sampleDepth) {
-    return clamp(1.0 - (currentDepth - sampleDepth) / SOFT_Z_EXTENT, 0.0, 1.0);
+float depthWeight(float depthA, float depthB) {
+    return clamp(1.0 - (depthA - depthB) / SOFT_Z_EXTENT, 0.0, 1.0);
+}
+
+float cone(float dist_norm, float len_norm) {
+    return clamp(1.0 - dist_norm / max(len_norm, 0.001), 0.0, 1.0);
+}
+
+float cylinder(float dist_norm, float len_norm) {
+    return 1.0 - smoothstep(0.95 * len_norm, 1.05 * len_norm, dist_norm);
+}
+
+vec2 chooseBlurVelocity(vec2 v, vec2 vmax, float uvPerPixel, bool enableVmax) {
+    if (!enableVmax) {
+        return v;
+    }
+
+    float vLen = length(v);
+    float vmaxLen = length(vmax);
+    if (vmaxLen < 1e-6) {
+        return v;
+    }
+
+    float vPixels = vLen / uvPerPixel;
+    float vmaxPixels = vmaxLen / uvPerPixel;
+    float speedMix = smoothstep(2.0, 12.0, vPixels);
+    float dominance = clamp((vmaxPixels - vPixels) / max(vmaxPixels, 1e-6), 0.0, 1.0);
+
+    vec2 vDir = vLen > 1e-6 ? v / vLen : vec2(0.0);
+    vec2 vmaxDir = vmax / vmaxLen;
+    float dirAgree = dot(vDir, vmaxDir) * 0.5 + 0.5;
+    float directionMix = smoothstep(0.65, 0.95, dirAgree);
+
+    float blend = speedMix * dominance * directionMix;
+    return mix(v, vmax, blend);
 }
 
 // -----------------------------------------------------------------------------
 // MAIN
 // -----------------------------------------------------------------------------
-
 out vec4 fragColor;
 
 void main() {
-    ivec2 resI = ivec2(uTD2DInfos[0].res);
-    vec2 res = vec2(resI);
     vec2 uv = vUV.st;
+    ivec2 colorSizeI = textureSize(sTD2DInputs[0], 0);
+    vec2 colorSize = vec2(colorSizeI);
+    vec2 invRes = 1.0 / colorSize;
 
-    float velocityScale = exposureTime;
+    vec2 v = decodeVelocity(readVelocityPoint(sTD2DInputs[1], uv)) * exposure;
+    // get the neighbor max velocity
 
-    vec2 vScale = decodeVelocity(texture(sTD2DInputs[1], uv).xy);
-    vec2 vmaxScale = decodeVelocity(texture(sTD2DInputs[2], uv).xy);
-
-    float vLen = length(vScale);
-    float vmaxLen = length(vmaxScale);
-
-    vec2 blurDir;
-    if (vLen > 1e-4) {
-        blurDir = vScale / vLen;
-    } else if (vmaxLen > 1e-4) {
-        blurDir = vmaxScale / vmaxLen;
-    } else {
-        blurDir = vec2(1.0, 0.0);
+    vec2 vmax = v;
+    if (useVmax) {
+        vmax = decodeVelocity(readVelocityPoint(sTD2DInputs[2], uv)) * exposure;
     }
 
-    float blurLen = clamp(vLen * velocityScale, 0.0, vmaxLen * velocityScale);
+    float uvPerPixel = max(invRes.x, invRes.y);
+    vec2 blurV = chooseBlurVelocity(v, vmax, uvPerPixel, useVmax);
+    float max_len = length(blurV);
+    float maxLenUV = MAX_BLUR_PIXELS * uvPerPixel;
+    if (max_len > maxLenUV) {
+        blurV *= maxLenUV / max_len;
+        max_len = maxLenUV;
+    }
 
-    vec2 blurVecUV = blurDir * blurLen;
+    if (max_len < 1e-4) {
+        fragColor = TDOutputSwizzle(texture(sTD2DInputs[0], uv));
+        return;
+    }
 
-    // -----------------------------
-    // 2. depth を見つつサンプル
-    // -----------------------------
+    float v_norm = length(v) / max_len;
+    float depthX = readDepthPoint(sTD2DInputs[3], uv);
 
-    float currentDepth = readDepth(sTD2DInputs[3], uv);
-
-    vec4 sum = vec4(0.0);
     float totalWeight = 0.0;
+    vec4 sum = vec4(0.0);
 
-    int N = int(sampleCount);
+    float blurPixels = max_len / uvPerPixel;
+    int N = int(clamp(sampleCount * (blurPixels / 8.0), 8.0, 64.0));
+    float jitter = (rand(uv) - 0.5) * 0.01;
 
     for (int i = 0; i < N; ++i) {
-        float t = (float(i) / float(N - 1)) * 2.0 - 1.0;
-        // Jitter
-        t += (rand(uv + vec2(i)) - 0.5) * 2.0 / float(N);
+        float t = mix(-1.0, 1.0, (float(i) + jitter + 0.5) / float(N));
 
-        vec2 offsetUV = blurVecUV * t * 0.5;
-        vec2 sampUV = clamp(uv + offsetUV, 0.0, 1.0);
+        vec2 offsetUV = blurV * t * 0.5;
+        vec2 sampUV = uv + offsetUV;
 
-        // Fetch color and depth
-        vec4 c = texture(sTD2DInputs[0], sampUV);
-        float sampleDepth = readDepth(sTD2DInputs[3], sampUV);
+        // skip out-of-bounds
+        if (sampUV.x < 0.0 || sampUV.x > 1.0 || sampUV.y < 0.0 || sampUV.y > 1.0) continue;
 
-        // Avoid blending background onto foreground
-        float dWeight = softDepthCompare(currentDepth, sampleDepth);
+        vec4 colorY = texture(sTD2DInputs[0], sampUV);
+        float depthY = readDepthPoint(sTD2DInputs[3], sampUV);
 
-        float dist = abs(t);
-        float cWeight = clamp(1.0 - dist, 0.0, 1.0);
+        vec2 vy = decodeVelocity(readVelocityPoint(sTD2DInputs[1], sampUV)) * exposure;
 
-        float weight = cWeight * dWeight;
+        float vy_norm = length(vy) / max_len;
 
-        sum += c * weight;
+        float dist_norm = abs(t);
+
+        float f = depthWeight(depthY, depthX);
+        float b = depthWeight(depthX, depthY);
+
+        float w_f = f * cone(dist_norm, vy_norm);
+        float w_b = b * cone(dist_norm, v_norm);
+        float w_c = cylinder(dist_norm, vy_norm) * cylinder(dist_norm, v_norm) * 2.0;
+
+        float weight = w_f + w_b + w_c;
+
+        sum += colorY * weight;
         totalWeight += weight;
     }
 
-    vec4 color = texture(sTD2DInputs[0], uv);
-
-    if (totalWeight < 1e-4)
-    {
-        fragColor = TDOutputSwizzle(color);
-    }
-    else
-    {
+    if (totalWeight < 1e-4) {
+        fragColor = TDOutputSwizzle(texture(sTD2DInputs[0], uv));
+    } else {
         fragColor = TDOutputSwizzle(sum / totalWeight);
     }
-
 }
