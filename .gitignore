@@ -5,3 +5,6 @@ Thumbs.db
 
 # Numbered TouchDesigner backups
 main.[0-9]*.toe
+
+*.mov
+*.mp4
